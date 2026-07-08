@@ -4,6 +4,7 @@ import { useState } from "react";
 import { motion } from "motion/react";
 import type { AssetKind, Chain, Timeframe } from "@/lib/types";
 import { useActiveWallet, usePnlReport } from "@/lib/hooks";
+import Link from "next/link";
 import { ConnectBar } from "@/components/connect-bar";
 import { Dashboard } from "@/components/dashboard";
 import { Ticker } from "@/components/ticker";
@@ -84,8 +85,16 @@ function Pnl3AppInner() {
       </main>
 
       <footer className="border-t border-border py-6 text-center text-xs text-muted">
-        PNL3 requests your address only — never a signature or transaction.
-        Numbers shown are demo data until API keys are configured.
+        <p>PNL3 requests your address only — never a signature or transaction.</p>
+        <p className="mt-2">
+          <Link href="/whitepaper" className="underline underline-offset-2 hover:text-foreground transition-colors">
+            Read the Whitepaper
+          </Link>
+          {" · "}
+          <a href="mailto:info@stsola.us" className="underline underline-offset-2 hover:text-foreground transition-colors">
+            info@stsola.us
+          </a>
+        </p>
       </footer>
     </div>
   );

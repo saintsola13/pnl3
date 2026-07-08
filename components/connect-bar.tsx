@@ -39,7 +39,9 @@ export function ConnectBar({
             fontWeight: 700,
             color: "var(--foreground)",
           }}
-        />
+        >
+          Connect Solana
+        </WalletMultiButton>
       </div>
 
       <div className="flex items-center gap-3 text-xs text-muted">
@@ -60,7 +62,7 @@ export function ConnectBar({
           <input
             value={addr}
             onChange={(e) => setAddr(e.target.value)}
-            placeholder="Paste an ETH (0x…) or Solana address"
+            placeholder="Paste an ETH (0x…) or SOL address"
             spellCheck={false}
             className="tabular w-full rounded-xl border border-border bg-surface py-2.5 pl-10 pr-24 text-sm outline-none transition-colors focus:border-accent"
           />
