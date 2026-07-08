@@ -28,6 +28,9 @@
     "viem": "^2.54.6",
     "wagmi": "^2.19.5"
   },
+  "pnpm": {
+    "ignoredBuiltDependencies": ["sharp", "unrs-resolver"]
+  },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
