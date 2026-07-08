@@ -1,26 +1,93 @@
 @import "tailwindcss";
 
+/*
+  PNL3 — degen terminal theme.
+  Dark-first. Green = profit, red = loss, violet = brand accent.
+  Text colors checked for >= 4.5:1 contrast on the near-black bg.
+*/
+
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  color-scheme: dark;
+
+  --background: #0a0b10;
+  --surface: #12141c;
+  --surface-2: #191c27;
+  --border: #262a38;
+  --foreground: #e9ecf5;
+  --muted: #8b90a6;
+
+  --profit: #2bff9e;
+  --profit-dim: #0f5138;
+  --loss: #ff4d6d;
+  --loss-dim: #5c1226;
+
+  --accent: #a06bff;
+  --accent-2: #22d3ee;
+
+  --glow-accent: 0 0 28px rgba(160, 107, 255, 0.45);
 }
 
 @theme inline {
   --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-border: var(--border);
   --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-profit: var(--profit);
+  --color-profit-dim: var(--profit-dim);
+  --color-loss: var(--loss);
+  --color-loss-dim: var(--loss-dim);
+  --color-accent: var(--accent);
+  --color-accent-2: var(--accent-2);
+
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+* {
+  border-color: var(--border);
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-sans), system-ui, sans-serif;
+  background-image:
+    radial-gradient(circle at 50% -20%, rgba(160, 107, 255, 0.12), transparent 55%),
+    linear-gradient(rgba(255, 255, 255, 0.018) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px);
+  background-size: 100% 100%, 40px 40px, 40px 40px;
+  background-attachment: fixed;
 }
+
+/* numeric readouts feel like a trading terminal */
+.tabular {
+  font-family: var(--font-mono), ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+.glow-accent { box-shadow: var(--glow-accent); }
+.text-glow-profit { text-shadow: 0 0 20px rgba(43, 255, 158, 0.45); }
+.text-glow-loss { text-shadow: 0 0 20px rgba(255, 77, 109, 0.45); }
+
+@keyframes pulse-ring {
+  0% { box-shadow: 0 0 0 0 rgba(160, 107, 255, 0.5); }
+  70% { box-shadow: 0 0 0 12px rgba(160, 107, 255, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(160, 107, 255, 0); }
+}
+.pulse-ring { animation: pulse-ring 2.2s infinite; }
+
+@keyframes marquee {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
+.marquee { animation: marquee 32s linear infinite; }
+
+::selection { background: rgba(160, 107, 255, 0.35); }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: var(--surface); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 6px; }
+::-webkit-scrollbar-thumb:hover { background: var(--muted); }
