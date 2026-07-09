@@ -1,23 +1,21 @@
-// Solana live provider — powered by Helius RPC + DAS API + Jupiter Price v3.
+// Solana live provider — powered by Helius RPC + DAS + Jupiter Price v3.
 //
-// Requires HELIUS_API_KEY. Returns null when the key is missing so the
-// router falls back to demo data.
+// Requires HELIUS_API_KEY. Returns null when key is missing (falls back to demo).
 //
-// Data sources:
-//   - Helius RPC getBalance              → native SOL balance
-//   - Helius RPC getTokenAccountsByOwner → SPL token accounts
-//   - Helius DAS getAssetsByOwner        → fungible token metadata
-//   - Jupiter Price API v3 (no key)      → live USD prices
-//   - Cost basis: unknown without tx history → approximated as current price
-//     (flat unrealized PnL until a paid tx-history endpoint is added)
+// Flow:
+//   1. Helius RPC getBalance             → native SOL lamports
+//   2. Helius RPC getTokenAccountsByOwner → SPL token accounts + amounts
+//   3. Jupiter Price API v3              → USD prices for all mints
+//   4. Filter to positions worth > $1   (skip dust / spam)
+//   5. Helius DAS getAssets (batch)     → symbol/name/logo for filtered tokens
 
 import type { PnlPoint, PnlReport, Position } from "@/lib/types";
 import type { PnlQuery } from "@/lib/providers/index";
 
-const SOL_MINT = "So11111111111111111111111111111111111111112";
+const SOL_MINT    = "So11111111111111111111111111111111111111112";
 const SOL_DECIMALS = 9;
-const TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-const TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+const TOKEN_PROGRAM  = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const TOKEN_2022     = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
 function key(): string | null {
   return process.env.HELIUS_API_KEY?.trim() || null;
@@ -27,197 +25,196 @@ function rpcUrl(apiKey: string): string {
   return `https://mainnet.helius-rpc.com/?api-key=${apiKey}`;
 }
 
-async function rpcCall(url: string, method: string, params: unknown[]): Promise<unknown> {
+async function rpcPost<T = unknown>(url: string, method: string, params: unknown): Promise<T> {
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
   });
-  if (!res.ok) throw new Error(`Helius RPC ${method} -> ${res.status}`);
-  const data = await res.json() as { result?: unknown; error?: { message: string } };
-  if (data.error) throw new Error(`Helius RPC ${method} error: ${data.error.message}`);
-  return data.result;
+  if (!res.ok) throw new Error(`Helius RPC ${method} -> HTTP ${res.status}`);
+  const data = await res.json() as { result?: T; error?: { message: string } };
+  if (data.error) throw new Error(`Helius RPC ${method}: ${data.error.message}`);
+  return data.result as T;
 }
 
-// Get native SOL balance in lamports.
-async function getSolBalance(address: string, url: string): Promise<number> {
-  const result = await rpcCall(url, "getBalance", [address, { commitment: "confirmed" }]) as { value: number };
-  return result?.value ?? 0;
+// --- SOL native balance ---
+async function getSolLamports(address: string, url: string): Promise<number> {
+  const r = await rpcPost<{ value: number }>(url, "getBalance", [address, { commitment: "confirmed" }]);
+  return r?.value ?? 0;
 }
 
-// Get all SPL token accounts for an address.
-async function getTokenAccounts(address: string, url: string): Promise<Array<{
-  mint: string;
-  amount: bigint;
-  decimals: number;
-}>> {
-  const fetchForProgram = async (programId: string) => {
-    const result = await rpcCall(url, "getTokenAccountsByOwner", [
-      address,
-      { programId },
-      { encoding: "jsonParsed", commitment: "confirmed" },
-    ]) as { value: Array<{ account: { data: { parsed: { info: { mint: string; tokenAmount: { amount: string; decimals: number } } } } } }> };
-    return (result?.value ?? []).map((a) => ({
-      mint: a.account.data.parsed.info.mint,
-      amount: BigInt(a.account.data.parsed.info.tokenAmount.amount),
-      decimals: a.account.data.parsed.info.tokenAmount.decimals,
-    }));
-  };
-
-  const [standard, token2022] = await Promise.all([
-    fetchForProgram(TOKEN_PROGRAM_ID),
-    fetchForProgram(TOKEN_2022_PROGRAM_ID),
+// --- SPL token accounts for one program ---
+async function fetchTokenProgram(address: string, programId: string, url: string) {
+  type Parsed = { account: { data: { parsed: { info: { mint: string; tokenAmount: { amount: string; decimals: number } } } } } };
+  const r = await rpcPost<{ value: Parsed[] }>(url, "getTokenAccountsByOwner", [
+    address,
+    { programId },
+    { encoding: "jsonParsed", commitment: "confirmed" },
   ]);
-  return [...standard, ...token2022];
+  return (r?.value ?? []).map((a) => ({
+    mint:    a.account.data.parsed.info.mint,
+    rawAmt:  a.account.data.parsed.info.tokenAmount.amount as string,
+    decimals: a.account.data.parsed.info.tokenAmount.decimals,
+  }));
 }
 
-// Fetch token metadata via Helius DAS getAssetsByOwner.
-async function getDasTokenMeta(address: string, url: string): Promise<Map<string, { symbol: string; name: string; logo?: string }>> {
-  const map = new Map<string, { symbol: string; name: string; logo?: string }>();
-  try {
-    const result = await rpcCall(url, "getAssetsByOwner", [{
-      ownerAddress: address,
-      page: 1,
-      limit: 1000,
-      displayOptions: { showFungible: true, showNativeBalance: false },
-    }]) as { items?: Array<{ id: string; content?: { metadata?: { symbol?: string; name?: string }; links?: { image?: string } }; token_info?: { symbol?: string } }> };
+// --- All SPL token accounts ---
+async function getAllTokenAccounts(address: string, url: string) {
+  const [std, t22] = await Promise.all([
+    fetchTokenProgram(address, TOKEN_PROGRAM,  url),
+    fetchTokenProgram(address, TOKEN_2022, url),
+  ]);
+  return [...std, ...t22].filter((t) => t.rawAmt !== "0" && t.rawAmt !== "");
+}
 
-    for (const asset of result?.items ?? []) {
-      const symbol = asset.content?.metadata?.symbol ?? asset.token_info?.symbol ?? "?";
-      const name = asset.content?.metadata?.name ?? symbol;
-      const logo = asset.content?.links?.image ?? undefined;
-      map.set(asset.id, { symbol, name, logo });
-    }
-  } catch {
-    // metadata is best-effort, fall through with defaults
-  }
+// --- Jupiter Price v3 (chunked to avoid URL length limits) ---
+async function getJupiterPrices(mints: string[]): Promise<Record<string, number>> {
+  if (!mints.length) return {};
+  const CHUNK = 100;
+  const chunks: string[][] = [];
+  for (let i = 0; i < mints.length; i += CHUNK) chunks.push(mints.slice(i, i + CHUNK));
+
+  const out: Record<string, number> = {};
+  await Promise.all(
+    chunks.map(async (ids) => {
+      try {
+        const res = await fetch(`https://lite-api.jup.ag/price/v3?ids=${ids.join(",")}`);
+        if (!res.ok) return;
+        const data = await res.json() as Record<string, { usdPrice?: number; price?: number }>;
+        for (const [mint, info] of Object.entries(data ?? {})) {
+          out[mint] = Number(info?.usdPrice ?? info?.price ?? 0);
+        }
+      } catch {
+        // chunk failed, skip
+      }
+    }),
+  );
+  return out;
+}
+
+// --- Batch metadata via Helius DAS getAssets ---
+async function batchMeta(
+  mints: string[],
+  url: string,
+): Promise<Map<string, { symbol: string; name: string; logo?: string }>> {
+  const map = new Map<string, { symbol: string; name: string; logo?: string }>();
+  if (!mints.length) return map;
+
+  // getAssets accepts up to 1000 ids at once
+  const CHUNK = 100;
+  const chunks: string[][] = [];
+  for (let i = 0; i < mints.length; i += CHUNK) chunks.push(mints.slice(i, i + CHUNK));
+
+  await Promise.all(
+    chunks.map(async (ids) => {
+      try {
+        type Asset = {
+          id: string;
+          content?: { metadata?: { symbol?: string; name?: string }; links?: { image?: string } };
+          token_info?: { symbol?: string };
+        };
+        const items = await rpcPost<Asset[]>(url, "getAssets", { ids });
+        for (const asset of items ?? []) {
+          const symbol = asset.content?.metadata?.symbol ?? asset.token_info?.symbol ?? "?";
+          const name   = asset.content?.metadata?.name   ?? symbol;
+          const logo   = asset.content?.links?.image ?? undefined;
+          map.set(asset.id, { symbol, name, logo });
+        }
+      } catch {
+        // best-effort — metadata failure is non-fatal
+      }
+    }),
+  );
   return map;
 }
 
-// Fetch USD prices from Jupiter v3 (completely free, no key).
-async function getJupiterPrices(mints: string[]): Promise<Record<string, number>> {
-  if (!mints.length) return {};
-  try {
-    const ids = mints.join(",");
-    const res = await fetch(`https://lite-api.jup.ag/price/v3?ids=${ids}`);
-    if (!res.ok) return {};
-    const data = await res.json() as Record<string, { usdPrice?: number; price?: number }>;
-    const prices: Record<string, number> = {};
-    for (const [mint, info] of Object.entries(data ?? {})) {
-      prices[mint] = Number(info?.usdPrice ?? info?.price ?? 0);
-    }
-    return prices;
-  } catch {
-    return {};
-  }
-}
-
-export async function fetchSolanaReport(
-  q: PnlQuery,
-  now: number,
-): Promise<PnlReport | null> {
+// --- Main ---
+export async function fetchSolanaReport(q: PnlQuery, now: number): Promise<PnlReport | null> {
   const apiKey = key();
   if (!apiKey) return null;
-  if (q.kind === "nft") return null; // NFT PnL via Magic Eden — wired later
+  if (q.kind === "nft") return null;
 
   const url = rpcUrl(apiKey);
 
-  const [lamports, tokenAccounts, meta] = await Promise.all([
-    getSolBalance(q.address, url),
-    getTokenAccounts(q.address, url),
-    getDasTokenMeta(q.address, url),
+  const [lamports, tokenAccounts] = await Promise.all([
+    getSolLamports(q.address, url),
+    getAllTokenAccounts(q.address, url),
   ]);
 
   const solAmount = lamports / 10 ** SOL_DECIMALS;
-
-  // Build mint list for price lookup.
   const tokenMints = tokenAccounts.map((t) => t.mint);
-  const allMints = [SOL_MINT, ...tokenMints];
-  const prices = await getJupiterPrices(allMints);
+
+  // Prices in one shot for SOL + all SPL tokens
+  const prices = await getJupiterPrices([SOL_MINT, ...tokenMints]);
 
   const solPrice = prices[SOL_MINT] ?? 0;
   const solValue = solAmount * solPrice;
 
-  const positions: Position[] = [];
+  // Build raw position candidates
+  type Candidate = { mint: string; amount: number; value: number };
+  const candidates: Candidate[] = [];
 
-  // Native SOL position.
   if (solAmount > 0.001) {
-    positions.push({
-      id: SOL_MINT,
-      symbol: "SOL",
-      name: "Solana",
-      kind: "crypto",
-      logo: "https://raw.githubusercontent.com/solana-labs/token-list/main/assets/mainnet/So11111111111111111111111111111111111111112/logo.png",
-      amount: solAmount,
-      avgCost: solPrice,
-      price: solPrice,
-      value: solValue,
-      unrealized: 0,
-      realized: 0,
-      pnl: 0,
-      pnlPct: 0,
-    });
+    candidates.push({ mint: SOL_MINT, amount: solAmount, value: solValue });
+  }
+  for (const t of tokenAccounts) {
+    const price  = prices[t.mint] ?? 0;
+    // rawAmt is a u64 string; use parseFloat to avoid BigInt (tsconfig target ES2017)
+    const amount = parseFloat(t.rawAmt) / 10 ** t.decimals;
+    const value  = amount * price;
+    if (value < 1) continue; // dust / spam
+    candidates.push({ mint: t.mint, amount, value });
   }
 
-  // SPL token positions.
-  for (const t of tokenAccounts) {
-    const price = prices[t.mint] ?? 0;
-    const amount = Number(t.amount) / 10 ** t.decimals;
-    const value = amount * price;
-    if (value < 1) continue; // skip dust
-    const m = meta.get(t.mint);
-    positions.push({
-      id: t.mint,
-      symbol: m?.symbol ?? "?",
-      name: m?.name ?? "Unknown",
-      kind: "crypto",
-      logo: m?.logo ?? undefined,
-      amount,
-      avgCost: price,
-      price,
-      value,
-      unrealized: 0,
-      realized: 0,
-      pnl: 0,
-      pnlPct: 0,
-    });
-  }
+  // Batch-fetch metadata only for tokens worth showing
+  const metaMints = candidates
+    .filter((c) => c.mint !== SOL_MINT)
+    .map((c) => c.mint);
+
+  const meta = await batchMeta(metaMints, url);
+
+  // Build final positions
+  const positions: Position[] = candidates.map((c) => {
+    const price = prices[c.mint] ?? 0;
+    if (c.mint === SOL_MINT) {
+      return {
+        id: SOL_MINT, symbol: "SOL", name: "Solana", kind: "crypto" as const,
+        logo: "https://raw.githubusercontent.com/solana-labs/token-list/main/assets/mainnet/So11111111111111111111111111111111111111112/logo.png",
+        amount: c.amount, avgCost: price, price, value: c.value,
+        unrealized: 0, realized: 0, pnl: 0, pnlPct: 0,
+      };
+    }
+    const m = meta.get(c.mint);
+    return {
+      id: c.mint, symbol: m?.symbol ?? "?", name: m?.name ?? c.mint.slice(0, 8) + "…",
+      kind: "crypto" as const, logo: m?.logo ?? undefined,
+      amount: c.amount, avgCost: price, price, value: c.value,
+      unrealized: 0, realized: 0, pnl: 0, pnlPct: 0,
+    };
+  });
 
   positions.sort((a, b) => b.value - a.value);
 
-  const totalValue = positions.reduce((s, p) => s + p.value, 0);
-  const costBasis = totalValue;
-  const totalPnl = 0;
-  const totalPnlPct = 0;
-
-  // Synthesize a flat series at current value (no historical data on free tier).
+  const totalValue  = positions.reduce((s, p) => s + p.value, 0);
   const n = 90;
   const span = 30 * 24 * 3600e3;
   const start = now - span;
-  const series: PnlPoint[] = Array.from({ length: n }, (_, i) => {
-    const t = Math.round(start + (span * i) / (n - 1));
-    return { t, value: totalValue, pnl: 0 };
-  });
+  const series: PnlPoint[] = Array.from({ length: n }, (_, i) => ({
+    t: Math.round(start + (span * i) / (n - 1)),
+    value: totalValue,
+    pnl: 0,
+  }));
   if (series.length) series[series.length - 1] = { t: now, value: totalValue, pnl: 0 };
 
   return {
-    chain: "solana",
-    address: q.address,
-    kind: "crypto",
-    timeframe: q.timeframe,
-    demo: false,
-    updatedAt: now,
-    totalValue,
-    totalPnl,
-    totalPnlPct,
-    realized: 0,
-    unrealized: 0,
-    costBasis,
+    chain: "solana", address: q.address, kind: "crypto",
+    timeframe: q.timeframe, demo: false, updatedAt: now,
+    totalValue, totalPnl: 0, totalPnlPct: 0,
+    realized: 0, unrealized: 0, costBasis: totalValue,
     winRate: 0,
-    bestTrade: positions[0] ?? null,
-    worstTrade: positions.length ? positions[positions.length - 1] : null,
+    bestTrade:  positions[0] ?? null,
+    worstTrade: positions.length > 1 ? positions[positions.length - 1] : null,
     diamondScore: 50,
-    series,
-    positions,
+    series, positions,
   };
 }
