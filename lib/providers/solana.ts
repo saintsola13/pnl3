@@ -183,34 +183,33 @@ async function getMeFloor(collectionMint: string): Promise<number | null> {
   }
 }
 
-// Batch-fetch ME floor prices for a list of collection mints.
+// Batch-fetch ME floor prices — all parallel, best-effort within 8s budget.
 async function getCollectionFloors(
   collectionMints: string[],
 ): Promise<Map<string, number>> {
   const map = new Map<string, number>();
-  // Concurrency-limited: ME has rate limits, so fan-out in chunks of 5
-  const CHUNK = 5;
-  for (let i = 0; i < collectionMints.length; i += CHUNK) {
-    const batch = collectionMints.slice(i, i + CHUNK);
-    await Promise.all(
-      batch.map(async (mint) => {
-        const floor = await getMeFloor(mint);
-        if (floor !== null) map.set(mint, floor);
-      }),
-    );
-  }
+  const TIMEOUT_MS = 8000;
+  const withTimeout = <T>(p: Promise<T>): Promise<T | null> =>
+    Promise.race([p, new Promise<null>((r) => setTimeout(() => r(null), TIMEOUT_MS))]);
+
+  await Promise.all(
+    collectionMints.map(async (mint) => {
+      const floor = await withTimeout(getMeFloor(mint));
+      if (floor !== null) map.set(mint, floor);
+    }),
+  );
   return map;
 }
 
 async function fetchSolanaNftReport(q: PnlQuery, now: number, apiKey: string): Promise<PnlReport | null> {
   const url = rpcUrl(apiKey);
 
-  // 1. Get SOL price (needed to convert lamport floor → USD)
-  const solPriceData = await getJupiterPrices([SOL_MINT]);
+  // 1. SOL price + NFTs in parallel
+  const [solPriceData, nfts] = await Promise.all([
+    getJupiterPrices([SOL_MINT]),
+    getAllNfts(q.address, url),
+  ]);
   const solPrice = solPriceData[SOL_MINT]?.usdPrice ?? 0;
-
-  // 2. Get all NFTs
-  const nfts = await getAllNfts(q.address, url);
 
   // 3. Group by collection → { collectionMint → [nfts] }
   type CollGroup = { mints: string[]; name: string; image?: string };
@@ -309,7 +308,16 @@ async function fetchSolanaNftReport(q: PnlQuery, now: number, apiKey: string): P
 export async function fetchSolanaReport(q: PnlQuery, now: number): Promise<PnlReport | null> {
   const apiKey = key();
   if (!apiKey) return null;
-  if (q.kind === "nft") return fetchSolanaNftReport(q, now, apiKey);
+  if (q.kind === "nft") {
+    return fetchSolanaNftReport(q, now, apiKey).catch(() => ({
+      chain: "solana" as const, address: q.address, kind: "nft" as const,
+      timeframe: q.timeframe, demo: false, updatedAt: now,
+      totalValue: 0, totalPnl: 0, totalPnlPct: 0,
+      realized: 0, unrealized: 0, costBasis: 0,
+      winRate: 0, bestTrade: null, worstTrade: null, diamondScore: 50,
+      series: [], positions: [],
+    }));
+  }
 
   const url = rpcUrl(apiKey);
 

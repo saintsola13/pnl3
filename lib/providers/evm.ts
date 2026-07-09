@@ -6,6 +6,7 @@
 
 import type { PnlPoint, PnlReport, Position } from "@/lib/types";
 import type { PnlQuery } from "@/lib/providers/index";
+import { fetchEvmNftReport } from "@/lib/providers/evm-nft";
 
 const BASE = "https://deep-index.moralis.io/api/v2.2";
 
@@ -37,7 +38,7 @@ export async function fetchEvmReport(
   now: number,
 ): Promise<PnlReport | null> {
   if (!key()) return null;
-  if (q.kind === "nft") return null; // NFT PnL wired separately; demo for now
+  if (q.kind === "nft") return fetchEvmNftReport(q, now);
 
   const chainParam = "eth";
   const summary = await mget(`/wallets/${q.address}/profitability/summary`, {
