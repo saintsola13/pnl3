@@ -18,8 +18,6 @@ async function mget(path: string, params: Record<string, string>) {
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
   const res = await fetch(url, {
     headers: { "X-API-Key": key() as string, accept: "application/json" },
-    // wallet data changes slowly; a short cache keeps us under rate limits
-    next: { revalidate: 60 },
   });
   if (!res.ok) throw new Error(`Moralis ${path} -> ${res.status}`);
   return res.json();

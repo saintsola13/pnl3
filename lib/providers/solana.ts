@@ -24,7 +24,6 @@ function key(): string | null {
 async function getBalances(address: string, apiKey: string) {
   const res = await fetch(
     `${HELIUS_BASE}/addresses/${address}/balances?api-key=${apiKey}`,
-    { next: { revalidate: 60 } },
   );
   if (!res.ok) throw new Error(`Helius balances -> ${res.status}`);
   return res.json() as Promise<{
@@ -45,9 +44,7 @@ async function getJupiterPrices(mints: string[]): Promise<Record<string, number>
   if (!mints.length) return {};
   try {
     const ids = mints.join(",");
-    const res = await fetch(`https://api.jup.ag/price/v2?ids=${ids}`, {
-      next: { revalidate: 60 },
-    });
+    const res = await fetch(`https://api.jup.ag/price/v2?ids=${ids}`);
     if (!res.ok) return {};
     const data = await res.json();
     const prices: Record<string, number> = {};
