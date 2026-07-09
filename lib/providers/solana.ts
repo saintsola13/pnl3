@@ -1,99 +1,144 @@
-// Solana live provider — powered by Birdeye.
+// Solana live provider — powered by Helius + Jupiter Price API.
 //
-// Requires BIRDEYE_API_KEY. Returns null when the key is missing so the
-// router falls back to demo data. Verify field mapping against
-// https://docs.birdeye.so before relying on exact numbers.
+// Requires HELIUS_API_KEY. Returns null when the key is missing so the
+// router falls back to demo data.
+//
+// Data sources:
+//   - Helius /v0/addresses/{address}/balances  → token list + native SOL
+//   - Jupiter Price API v2 (no key needed)     → live USD prices
+//   - Cost basis: unknown without tx history → approximated as current price
+//     (flat unrealized PnL until a paid tx-history endpoint is added)
 
 import type { PnlPoint, PnlReport, Position } from "@/lib/types";
 import type { PnlQuery } from "@/lib/providers/index";
 
-const BASE = "https://public-api.birdeye.so";
+const HELIUS_BASE = "https://api.helius.xyz/v0";
+const SOL_MINT = "So11111111111111111111111111111111111111112";
+const SOL_DECIMALS = 9;
 
 function key(): string | null {
-  return process.env.BIRDEYE_API_KEY?.trim() || null;
+  return process.env.HELIUS_API_KEY?.trim() || null;
 }
 
-async function bget(path: string, params: Record<string, string>) {
-  const url = new URL(BASE + path);
-  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
-  const res = await fetch(url, {
-    headers: {
-      "X-API-KEY": key() as string,
-      "x-chain": "solana",
-      accept: "application/json",
-    },
-    next: { revalidate: 60 },
-  });
-  if (!res.ok) throw new Error(`Birdeye ${path} -> ${res.status}`);
-  return res.json();
+// Fetch all token balances + native SOL from Helius.
+async function getBalances(address: string, apiKey: string) {
+  const res = await fetch(
+    `${HELIUS_BASE}/addresses/${address}/balances?api-key=${apiKey}`,
+    { next: { revalidate: 60 } },
+  );
+  if (!res.ok) throw new Error(`Helius balances -> ${res.status}`);
+  return res.json() as Promise<{
+    tokens: Array<{
+      mint: string;
+      amount: number;
+      decimals: number;
+      symbol?: string;
+      name?: string;
+      logoURI?: string;
+    }>;
+    nativeBalance: number; // lamports
+  }>;
 }
 
-function num(obj: Record<string, unknown>, ...keys: string[]): number {
-  for (const k of keys) {
-    const v = obj?.[k];
-    if (v != null && !Number.isNaN(Number(v))) return Number(v);
+// Fetch USD prices from Jupiter (completely free, no key).
+async function getJupiterPrices(mints: string[]): Promise<Record<string, number>> {
+  if (!mints.length) return {};
+  try {
+    const ids = mints.join(",");
+    const res = await fetch(`https://api.jup.ag/price/v2?ids=${ids}`, {
+      next: { revalidate: 60 },
+    });
+    if (!res.ok) return {};
+    const data = await res.json();
+    const prices: Record<string, number> = {};
+    for (const [mint, info] of Object.entries(data.data ?? {})) {
+      prices[mint] = Number((info as Record<string, unknown>).price ?? 0);
+    }
+    return prices;
+  } catch {
+    return {};
   }
-  return 0;
 }
 
 export async function fetchSolanaReport(
   q: PnlQuery,
   now: number,
 ): Promise<PnlReport | null> {
-  if (!key()) return null;
-  if (q.kind === "nft") return null; // NFT PnL via Magic Eden wired later
+  const apiKey = key();
+  if (!apiKey) return null;
+  if (q.kind === "nft") return null; // NFT PnL via Magic Eden — wired later
 
-  // Portfolio holdings + current value.
-  const portfolio = await bget("/v1/wallet/token_list", { wallet: q.address });
-  const items: Record<string, unknown>[] = Array.isArray(portfolio?.data?.items)
-    ? portfolio.data.items
-    : [];
+  const balances = await getBalances(q.address, apiKey);
 
-  const positions: Position[] = items
-    .map((it, i) => {
-      const value = num(it, "valueUsd", "value_usd");
-      const price = num(it, "priceUsd", "price");
-      const amount = num(it, "uiAmount", "balance");
-      // Birdeye's basic token_list has no cost basis; approximate with a
-      // conservative unrealized estimate. Use /defi wallet PnL endpoint when
-      // available on your plan for true realized/unrealized splits.
-      const avgCost = price; // unknown basis -> flat until PnL endpoint added
-      return {
-        id: String(it.address ?? i),
-        symbol: String(it.symbol ?? "?"),
-        name: String(it.name ?? "Unknown"),
-        kind: "crypto" as const,
-        logo: (it.logoURI as string) ?? undefined,
-        amount,
-        avgCost,
-        price,
-        value,
-        unrealized: 0,
-        realized: 0,
-        pnl: 0,
-        pnlPct: 0,
-      };
-    })
-    .filter((p) => p.value > 1);
+  // Build mint list including native SOL wrapper for price lookup.
+  const tokenMints = (balances.tokens ?? []).map((t) => t.mint);
+  const allMints = [SOL_MINT, ...tokenMints];
+  const prices = await getJupiterPrices(allMints);
+
+  const solPrice = prices[SOL_MINT] ?? 0;
+  const solAmount = (balances.nativeBalance ?? 0) / 10 ** SOL_DECIMALS;
+  const solValue = solAmount * solPrice;
+
+  const positions: Position[] = [];
+
+  // Native SOL position.
+  if (solAmount > 0.001) {
+    positions.push({
+      id: SOL_MINT,
+      symbol: "SOL",
+      name: "Solana",
+      kind: "crypto",
+      logo: "https://raw.githubusercontent.com/solana-labs/token-list/main/assets/mainnet/So11111111111111111111111111111111111111112/logo.png",
+      amount: solAmount,
+      avgCost: solPrice, // no cost basis available on free tier
+      price: solPrice,
+      value: solValue,
+      unrealized: 0,
+      realized: 0,
+      pnl: 0,
+      pnlPct: 0,
+    });
+  }
+
+  // SPL token positions.
+  for (const t of balances.tokens ?? []) {
+    const price = prices[t.mint] ?? 0;
+    const amount = t.amount / 10 ** (t.decimals ?? 0);
+    const value = amount * price;
+    if (value < 1) continue; // skip dust
+    positions.push({
+      id: t.mint,
+      symbol: t.symbol ?? "?",
+      name: t.name ?? "Unknown",
+      kind: "crypto",
+      logo: t.logoURI ?? undefined,
+      amount,
+      avgCost: price, // no cost basis without tx history
+      price,
+      value,
+      unrealized: 0,
+      realized: 0,
+      pnl: 0,
+      pnlPct: 0,
+    });
+  }
 
   positions.sort((a, b) => b.value - a.value);
 
   const totalValue = positions.reduce((s, p) => s + p.value, 0);
-  const costBasis = positions.reduce((s, p) => s + p.avgCost * p.amount, 0);
-  const totalPnl = positions.reduce((s, p) => s + p.pnl, 0);
-  const totalPnlPct = costBasis > 0 ? totalPnl / costBasis : 0;
-  const sorted = [...positions].sort((a, b) => b.pnl - a.pnl);
+  const costBasis = totalValue; // approximation until tx-history PnL is added
+  const totalPnl = 0;
+  const totalPnlPct = 0;
 
+  // Synthesize a flat series at current value (no historical data on free tier).
   const n = 90;
   const span = 30 * 24 * 3600e3;
   const start = now - span;
-  const series: PnlPoint[] = [];
-  for (let i = 0; i < n; i++) {
-    const p = i / (n - 1);
-    const value = costBasis + (totalValue - costBasis) * p;
-    series.push({ t: Math.round(start + span * p), value, pnl: value - costBasis });
-  }
-  if (series.length) series[series.length - 1] = { t: now, value: totalValue, pnl: totalPnl };
+  const series: PnlPoint[] = Array.from({ length: n }, (_, i) => {
+    const t = Math.round(start + (span * i) / (n - 1));
+    return { t, value: totalValue, pnl: 0 };
+  });
+  if (series.length) series[series.length - 1] = { t: now, value: totalValue, pnl: 0 };
 
   return {
     chain: "solana",
@@ -106,11 +151,11 @@ export async function fetchSolanaReport(
     totalPnl,
     totalPnlPct,
     realized: 0,
-    unrealized: totalPnl,
+    unrealized: 0,
     costBasis,
-    winRate: positions.length ? positions.filter((p) => p.pnl >= 0).length / positions.length : 0,
-    bestTrade: sorted[0] ?? null,
-    worstTrade: sorted.length ? sorted[sorted.length - 1] : null,
+    winRate: 0,
+    bestTrade: positions[0] ?? null,
+    worstTrade: positions.length ? positions[positions.length - 1] : null,
     diamondScore: 50,
     series,
     positions,
