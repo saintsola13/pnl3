@@ -133,11 +133,183 @@ async function batchMeta(
   return map;
 }
 
+// ─── NFT support ────────────────────────────────────────────────────────────
+
+const NFT_INTERFACES = new Set(["V1_NFT", "ProgrammableNFT", "V1_PRINT", "MplCoreAsset"]);
+
+type DasNft = {
+  id: string;
+  interface: string;
+  content?: { metadata?: { name?: string; symbol?: string }; links?: { image?: string } };
+  grouping?: Array<{ group_key: string; group_value: string }>;
+};
+
+// Paginate through DAS to collect all NFTs owned by address.
+async function getAllNfts(address: string, url: string): Promise<DasNft[]> {
+  const all: DasNft[] = [];
+  const LIMIT = 1000;
+  let page = 1;
+  while (true) {
+    type DasPage = { items: DasNft[]; total: number };
+    const r = await rpcPost<DasPage>(url, "getAssetsByOwner", {
+      ownerAddress: address,
+      page,
+      limit: LIMIT,
+      displayOptions: { showFungible: false, showNativeBalance: false },
+    });
+    const items = (r?.items ?? []).filter((a) => NFT_INTERFACES.has(a.interface));
+    all.push(...items);
+    if (all.length >= (r?.total ?? 0) || (r?.items ?? []).length < LIMIT) break;
+    page++;
+    if (page > 10) break; // safety cap — 10k NFTs max
+  }
+  return all;
+}
+
+// Fetch floor price (lamports) for a collection mint from Magic Eden v2.
+// Returns null if collection not found / no floor.
+async function getMeFloor(collectionMint: string): Promise<number | null> {
+  try {
+    const res = await fetch(
+      `https://api-mainnet.magiceden.dev/v2/collections/${collectionMint}/stats`,
+    );
+    if (!res.ok) return null;
+    const data = await res.json() as { floorPrice?: number };
+    return typeof data.floorPrice === "number" && data.floorPrice > 0
+      ? data.floorPrice
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+// Batch-fetch ME floor prices for a list of collection mints.
+async function getCollectionFloors(
+  collectionMints: string[],
+): Promise<Map<string, number>> {
+  const map = new Map<string, number>();
+  // Concurrency-limited: ME has rate limits, so fan-out in chunks of 5
+  const CHUNK = 5;
+  for (let i = 0; i < collectionMints.length; i += CHUNK) {
+    const batch = collectionMints.slice(i, i + CHUNK);
+    await Promise.all(
+      batch.map(async (mint) => {
+        const floor = await getMeFloor(mint);
+        if (floor !== null) map.set(mint, floor);
+      }),
+    );
+  }
+  return map;
+}
+
+async function fetchSolanaNftReport(q: PnlQuery, now: number, apiKey: string): Promise<PnlReport | null> {
+  const url = rpcUrl(apiKey);
+
+  // 1. Get SOL price (needed to convert lamport floor → USD)
+  const solPriceData = await getJupiterPrices([SOL_MINT]);
+  const solPrice = solPriceData[SOL_MINT]?.usdPrice ?? 0;
+
+  // 2. Get all NFTs
+  const nfts = await getAllNfts(q.address, url);
+
+  // 3. Group by collection → { collectionMint → [nfts] }
+  type CollGroup = { mints: string[]; name: string; image?: string };
+  const byCollection = new Map<string, CollGroup>();
+  const noCollection: DasNft[] = [];
+
+  for (const nft of nfts) {
+    const collGrouping = (nft.grouping ?? []).find((g) => g.group_key === "collection");
+    const collMint = collGrouping?.group_value;
+    if (!collMint) { noCollection.push(nft); continue; }
+    if (!byCollection.has(collMint)) {
+      byCollection.set(collMint, {
+        mints: [],
+        name: nft.content?.metadata?.name ?? "Unknown Collection",
+        image: nft.content?.links?.image ?? undefined,
+      });
+    }
+    const g = byCollection.get(collMint)!;
+    g.mints.push(nft.id);
+    // Use first NFT's name without the #N suffix as collection name
+    if (g.mints.length === 1) {
+      g.name = (nft.content?.metadata?.name ?? "Unknown").replace(/#\s*\d+$/, "").trim();
+      g.image = nft.content?.links?.image ?? undefined;
+    }
+  }
+
+  // 4. Fetch floor prices for all unique collections
+  const collectionMints = Array.from(byCollection.keys());
+  const floors = await getCollectionFloors(collectionMints);
+
+  // 5. Build positions — one per collection
+  const positions: Position[] = [];
+
+  for (const [collMint, group] of byCollection) {
+    const floorLamports = floors.get(collMint) ?? 0;
+    const floorSol  = floorLamports / 1e9;
+    const floorUsd  = floorSol * solPrice;
+    const count     = group.mints.length;
+    const value     = floorUsd * count;
+    if (value < 0.01 && floorLamports === 0) continue; // no price + probably spam
+    positions.push({
+      id:     collMint,
+      symbol: group.name.length > 12 ? group.name.slice(0, 12) + "…" : group.name,
+      name:   group.name,
+      kind:   "nft" as const,
+      logo:   group.image,
+      amount: count,
+      avgCost: floorUsd,
+      price:   floorUsd,
+      value,
+      unrealized: 0,
+      realized:   0,
+      pnl:     0,
+      pnlPct:  0,
+    });
+  }
+
+  // Ungrouped NFTs (no collection) — count them but $0
+  if (noCollection.length > 0) {
+    positions.push({
+      id: "__no_collection__",
+      symbol: "Other NFTs",
+      name: `${noCollection.length} NFTs (no collection)`,
+      kind: "nft" as const,
+      amount: noCollection.length,
+      avgCost: 0, price: 0, value: 0,
+      unrealized: 0, realized: 0, pnl: 0, pnlPct: 0,
+    });
+  }
+
+  positions.sort((a, b) => b.value - a.value);
+
+  const totalValue = positions.reduce((s, p) => s + p.value, 0);
+  const n = 30;
+  const span = 30 * 24 * 3600e3;
+  const series: PnlPoint[] = Array.from({ length: n }, (_, i) => ({
+    t: Math.round(now - span + (span * i) / (n - 1)),
+    value: totalValue,
+    pnl: 0,
+  }));
+
+  return {
+    chain: "solana", address: q.address, kind: "nft",
+    timeframe: q.timeframe, demo: false, updatedAt: now,
+    totalValue, totalPnl: 0, totalPnlPct: 0,
+    realized: 0, unrealized: 0, costBasis: totalValue,
+    winRate: 0,
+    bestTrade:  positions[0] ?? null,
+    worstTrade: positions.length > 1 ? positions[positions.length - 1] : null,
+    diamondScore: 50,
+    series, positions,
+  };
+}
+
 // --- Main ---
 export async function fetchSolanaReport(q: PnlQuery, now: number): Promise<PnlReport | null> {
   const apiKey = key();
   if (!apiKey) return null;
-  if (q.kind === "nft") return null;
+  if (q.kind === "nft") return fetchSolanaNftReport(q, now, apiKey);
 
   const url = rpcUrl(apiKey);
 
